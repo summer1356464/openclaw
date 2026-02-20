@@ -18,11 +18,13 @@ import {
   writeCache,
 } from "./web-shared.js";
 
-const SEARCH_PROVIDERS = ["brave", "perplexity", "grok"] as const;
+const SEARCH_PROVIDERS = ["brave", "perplexity", "grok", "baidu"] as const;
 const DEFAULT_SEARCH_COUNT = 5;
 const MAX_SEARCH_COUNT = 10;
 
 const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
+const BAIDU_SEARCH_ENDPOINT = "https://www.baidu.com/s";
+const BAIDU_QIANFAN_API_ENDPOINT = "https://qianfan.baidubce.com/v2/ai_search/web_summary";
 const DEFAULT_PERPLEXITY_BASE_URL = "https://openrouter.ai/api/v1";
 const PERPLEXITY_DIRECT_BASE_URL = "https://api.perplexity.ai";
 const DEFAULT_PERPLEXITY_MODEL = "perplexity/sonar-pro";
@@ -31,6 +33,9 @@ const OPENROUTER_KEY_PREFIXES = ["sk-or-"];
 
 const XAI_API_ENDPOINT = "https://api.x.ai/v1/responses";
 const DEFAULT_GROK_MODEL = "grok-4-1-fast";
+
+// 百度搜索API默认配置
+const DEFAULT_BAIDU_API_KEY = "";
 
 const SEARCH_CACHE = new Map<string, CacheEntry<Record<string, unknown>>>();
 const BRAVE_FRESHNESS_SHORTCUTS = new Set(["pd", "pw", "pm", "py"]);
@@ -180,12 +185,13 @@ function resolveSearchEnabled(params: { search?: WebSearchConfig; sandboxed?: bo
 }
 
 function resolveSearchApiKey(search?: WebSearchConfig): string | undefined {
-  const fromConfig =
+  const fromConfig = 
     search && "apiKey" in search && typeof search.apiKey === "string"
       ? normalizeSecretInput(search.apiKey)
       : "";
   const fromEnv = normalizeSecretInput(process.env.BRAVE_API_KEY);
-  return fromConfig || fromEnv || undefined;
+  const baiduApiKey = normalizeSecretInput(process.env.BAIDU_API_KEY);
+  return fromConfig || fromEnv || baiduApiKey;
 }
 
 function missingSearchKeyPayload(provider: (typeof SEARCH_PROVIDERS)[number]) {
@@ -205,6 +211,13 @@ function missingSearchKeyPayload(provider: (typeof SEARCH_PROVIDERS)[number]) {
       docs: "https://docs.openclaw.ai/tools/web",
     };
   }
+  if (provider === "baidu") {
+    return {
+      error: "baidu_search_no_api_key",
+      message: "web_search (baidu) needs a Baidu Qianfan API key. Set BAIDU_API_KEY in the Gateway environment, or configure tools.web.search.apiKey.",
+      docs: "https://cloud.baidu.com/doc/qianfan-api/s/wmjqtqr7w",
+    };
+  }
   return {
     error: "missing_brave_api_key",
     message: `web_search needs a Brave Search API key. Run \`${formatCliCommand("openclaw configure --section web")}\` to store it, or set BRAVE_API_KEY in the Gateway environment.`,
@@ -213,7 +226,7 @@ function missingSearchKeyPayload(provider: (typeof SEARCH_PROVIDERS)[number]) {
 }
 
 function resolveSearchProvider(search?: WebSearchConfig): (typeof SEARCH_PROVIDERS)[number] {
-  const raw =
+  const raw = 
     search && "provider" in search && typeof search.provider === "string"
       ? search.provider.trim().toLowerCase()
       : "";
@@ -223,10 +236,13 @@ function resolveSearchProvider(search?: WebSearchConfig): (typeof SEARCH_PROVIDE
   if (raw === "grok") {
     return "grok";
   }
+  if (raw === "baidu") {
+    return "baidu";
+  }
   if (raw === "brave") {
     return "brave";
   }
-  return "brave";
+  return "baidu";
 }
 
 function resolvePerplexityConfig(search?: WebSearchConfig): PerplexityConfig {
@@ -446,6 +462,87 @@ function resolveSiteName(url: string | undefined): string | undefined {
   }
 }
 
+function parseBaiduSearchResults(html: string, maxResults: number): Array<{ title?: string; url?: string; description?: string; age?: string }> {
+  const results: Array<{ title?: string; url?: string; description?: string; age?: string }> = [];
+  
+  // 检测是否是百度验证码页面
+  if (html.includes('验证码') || html.includes('验证中心') || html.includes('安全验证')) {
+    return [
+      {
+        title: "百度安全验证",
+        url: "https://www.baidu.com",
+        description: "百度需要安全验证，请在浏览器中完成验证后再搜索。"
+      }
+    ];
+  }
+  
+  // 清理HTML，移除多余的空白字符和注释
+  const cleanedHtml = html
+    .replace(/\s+/g, ' ')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .trim();
+  
+  // 尝试匹配百度搜索结果的不同格式
+  const resultPatterns = [
+    // 标准搜索结果格式
+    /<div[^>]*class=["']result["'][^>]*>.*?<h3[^>]*class=["']t["'][^>]*>.*?<a[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>.*?<div[^>]*class=["']c-abstract["'][^>]*>(.*?)<\/div>/gs,
+    // 其他可能的格式
+    /<div[^>]*class=["']result-op["'][^>]*>.*?<h3[^>]*class=["']t["'][^>]*>.*?<a[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>.*?<div[^>]*class=["']c-abstract["'][^>]*>(.*?)<\/div>/gs,
+    // 更通用的格式
+    /<div[^>]*class=["']c-container["'][^>]*>.*?<a[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>.*?<div[^>]*class=["']c-abstract["'][^>]*>(.*?)<\/div>/gs,
+    // 简化的格式
+    /<h3[^>]*class=["']t["'][^>]*>.*?<a[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>.*?<div[^>]*class=["']c-abstract["'][^>]*>(.*?)<\/div>/gs,
+    // 最通用的格式
+    /<a[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>.*?<div[^>]*class=["']c-abstract["'][^>]*>(.*?)<\/div>/gs
+  ];
+  
+  // 调试：输出清理后的HTML的前500个字符
+  console.log('清理后的HTML预览:', cleanedHtml.substring(0, 500));
+  
+  for (const pattern of resultPatterns) {
+    let match;
+    while ((match = pattern.exec(cleanedHtml)) !== null && results.length < maxResults) {
+      const [, url, titleHtml, descHtml] = match;
+      
+      // 清理HTML标签
+      const title = titleHtml.replace(/<[^>]*>/g, '').trim();
+      const description = descHtml.replace(/<[^>]*>/g, '').trim();
+      
+      if (title && url) {
+        // 处理百度URL
+        let processedUrl = url;
+        if (processedUrl.includes('/url?q=')) {
+          processedUrl = decodeURIComponent(processedUrl.replace(/\/url\?q=/, '').split('&')[0]);
+        }
+        
+        // 调试：输出找到的结果
+        console.log('找到搜索结果:', { title, url: processedUrl, description });
+        
+        results.push({
+          title,
+          url: processedUrl,
+          description
+        });
+      }
+    }
+  }
+  
+  // 如果没有找到结果，返回模拟数据
+  if (results.length === 0) {
+    // 调试：输出未找到结果的原因
+    console.log('未找到百度搜索结果，返回默认消息');
+    return [
+      {
+        title: "百度搜索结果",
+        url: "https://www.baidu.com",
+        description: "无法解析百度搜索结果，请在浏览器中查看。"
+      }
+    ];
+  }
+  
+  return results;
+}
+
 async function runPerplexitySearch(params: {
   query: string;
   apiKey: string;
@@ -572,7 +669,9 @@ async function runWebSearch(params: {
       ? `${params.provider}:${params.query}:${params.count}:${params.country || "default"}:${params.search_lang || "default"}:${params.ui_lang || "default"}:${params.freshness || "default"}`
       : params.provider === "perplexity"
         ? `${params.provider}:${params.query}:${params.perplexityBaseUrl ?? DEFAULT_PERPLEXITY_BASE_URL}:${params.perplexityModel ?? DEFAULT_PERPLEXITY_MODEL}:${params.freshness || "default"}`
-        : `${params.provider}:${params.query}:${params.grokModel ?? DEFAULT_GROK_MODEL}:${String(params.grokInlineCitations ?? false)}`,
+        : params.provider === "grok"
+          ? `${params.provider}:${params.query}:${params.grokModel ?? DEFAULT_GROK_MODEL}:${String(params.grokInlineCitations ?? false)}`
+          : `${params.provider}:${params.query}:${params.count}:${params.search_lang || "default"}`,
   );
   const cached = readCache(SEARCH_CACHE, cacheKey);
   if (cached) {
@@ -632,6 +731,112 @@ async function runWebSearch(params: {
       content: wrapWebContent(content),
       citations,
       inlineCitations,
+    };
+    writeCache(SEARCH_CACHE, cacheKey, payload, params.cacheTtlMs);
+    return payload;
+  }
+
+  if (params.provider === "baidu") {
+    // 检查百度API密钥
+    if (!params.apiKey) {
+      throw new Error("Baidu Search API requires an API key. Set BAIDU_API_KEY in the environment or configure tools.web.search.apiKey.");
+    }
+    
+    // 使用百度官方智能搜索API
+    const url = BAIDU_QIANFAN_API_ENDPOINT;
+    
+    // 百度搜索API请求
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Appbuilder-Authorization": `Bearer ${params.apiKey}`,
+        "X-Appbuilder-Request-Id": `req_${Date.now()}`,
+        "X-Appbuilder-User-Id": `user_${Date.now()}`,
+      },
+      body: JSON.stringify({
+        messages: [
+          {
+            role: "user",
+            content: params.query
+          }
+        ],
+        stream: false,
+        resource_type_filter: [
+          {
+            type: "web",
+            top_k: params.count
+          },
+          {
+            type: "video",
+            top_k: 0
+          },
+          {
+            type: "image",
+            top_k: 0
+          }
+        ]
+      }),
+      signal: withTimeout(undefined, params.timeoutSeconds * 1000),
+    });
+
+    if (!res.ok) {
+      const detailResult = await readResponseText(res, { maxBytes: 64_000 });
+      const detail = detailResult.text;
+      throw new Error(`Baidu Search API error (${res.status}): ${detail || res.statusText}`);
+    }
+
+    const data = await res.json();
+    console.log('百度搜索API响应:', JSON.stringify(data, null, 2));
+    
+    // 处理百度搜索API响应
+    let finalResults = [];
+    
+    // 优先使用 references 中的搜索结果
+    if (Array.isArray(data.references)) {
+      finalResults = data.references.map((entry: any) => {
+        const title = entry.title || "";
+        const url = entry.url || "";
+        const description = entry.snippet || entry.content || "";
+        const rawSiteName = resolveSiteName(url);
+        return {
+          title: title ? wrapWebContent(title, "web_search") : "",
+          url, // Keep raw for tool chaining
+          description: description ? wrapWebContent(description, "web_search") : "",
+          published: entry.date || undefined,
+          siteName: rawSiteName || entry.website || undefined,
+        };
+      });
+    }
+
+    // 如果没有搜索结果，使用模型生成的内容作为单一结果
+    if (finalResults.length === 0 && data.choices && data.choices.length > 0) {
+      const content = data.choices[0].message?.content || "";
+      if (content) {
+        finalResults = [{
+          title: wrapWebContent(params.query, "web_search"),
+          url: `https://www.baidu.com/s?wd=${encodeURIComponent(params.query)}`,
+          description: wrapWebContent(content.substring(0, 200) + (content.length > 200 ? '...' : ''), "web_search"),
+          siteName: "www.baidu.com",
+        }];
+      }
+    }
+
+    const payload = {
+      query: params.query,
+      provider: params.provider,
+      count: finalResults.length,
+      tookMs: Date.now() - start,
+      externalContent: {
+        untrusted: true,
+        source: "web_search",
+        provider: params.provider,
+        wrapped: true,
+      },
+      results: finalResults,
+      // 保留原始的模型回答内容
+      content: data.choices?.[0]?.message?.content ? wrapWebContent(data.choices[0].message.content, "web_search") : undefined,
     };
     writeCache(SEARCH_CACHE, cacheKey, payload, params.cacheTtlMs);
     return payload;
@@ -723,7 +928,9 @@ export function createWebSearchTool(options?: {
       ? "Search the web using Perplexity Sonar (direct or via OpenRouter). Returns AI-synthesized answers with citations from real-time web search."
       : provider === "grok"
         ? "Search the web using xAI Grok. Returns AI-synthesized answers with citations from real-time web search."
-        : "Search the web using Brave Search API. Supports region-specific and localized search via country and language parameters. Returns titles, URLs, and snippets for fast research.";
+        : provider === "baidu"
+          ? "Search the web using Baidu Qianfan Search API. Returns titles, URLs, and snippets for fast research. Requires Baidu Qianfan API key."
+          : "Search the web using Brave Search API. Supports region-specific and localized search via country and language parameters. Returns titles, URLs, and snippets for fast research.";
 
   return {
     label: "Web Search",
@@ -733,16 +940,18 @@ export function createWebSearchTool(options?: {
     execute: async (_toolCallId, args) => {
       const perplexityAuth =
         provider === "perplexity" ? resolvePerplexityApiKey(perplexityConfig) : undefined;
-      const apiKey =
+      let apiKey =
         provider === "perplexity"
           ? perplexityAuth?.apiKey
           : provider === "grok"
             ? resolveGrokApiKey(grokConfig)
             : resolveSearchApiKey(search);
 
+      // 检查API密钥
       if (!apiKey) {
         return jsonResult(missingSearchKeyPayload(provider));
       }
+      
       const params = args as Record<string, unknown>;
       const query = readStringParam(params, "query", { required: true });
       const count =
