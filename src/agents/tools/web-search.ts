@@ -24,7 +24,9 @@ const MAX_SEARCH_COUNT = 10;
 
 const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
 const BAIDU_SEARCH_ENDPOINT = "https://www.baidu.com/s";
-const BAIDU_QIANFAN_API_ENDPOINT = "https://qianfan.baidubce.com/v2/ai_search/web_summary";
+const BAIDU_QIANFAN_API_ENDPOINT = "https://qianfan.baidubce.com/v2/ai_search/web_summary"; // 智能搜索生成（高性能版）
+const BAIDU_CHAT_COMPLETIONS_ENDPOINT = "https://qianfan.baidubce.com/v2/ai_search/chat/completions"; // 智能搜索生成
+const BAIDU_WEB_SEARCH_ENDPOINT = "https://qianfan.baidubce.com/v2/ai_search/web_search"; // 百度搜索
 const DEFAULT_PERPLEXITY_BASE_URL = "https://openrouter.ai/api/v1";
 const PERPLEXITY_DIRECT_BASE_URL = "https://api.perplexity.ai";
 const DEFAULT_PERPLEXITY_MODEL = "perplexity/sonar-pro";
@@ -70,6 +72,12 @@ const WebSearchSchema = Type.Object({
     Type.String({
       description:
         "Filter results by discovery time. Brave supports 'pd', 'pw', 'pm', 'py', and date range 'YYYY-MM-DDtoYYYY-MM-DD'. Perplexity supports 'pd', 'pw', 'pm', and 'py'.",
+    }),
+  ),
+  baiduSearchType: Type.Optional(
+    Type.String({
+      description:
+        "Baidu search API type: 'intelligent' (高性能版), 'chat_completions' (智能搜索生成), 'web_search' (百度搜索).",
     }),
   ),
 });
@@ -129,6 +137,29 @@ type GrokSearchResponse = {
     end_index: number;
     url: string;
   }>;
+};
+
+// 百度搜索请求类型
+type BaiduSearchType = 'intelligent' | 'chat_completions' | 'web_search';
+
+// 百度搜索API响应类型
+type BaiduSearchResult = {
+  title?: string;
+  url?: string;
+  description?: string;
+  age?: string;
+  siteName?: string;
+};
+
+// 百度搜索API通用请求参数
+type BaiduSearchParams = {
+  query: string;
+  apiKey: string;
+  count: number;
+  timeoutSeconds: number;
+  freshness?: string;
+  searchType?: BaiduSearchType;
+  model?: string;
 };
 
 type PerplexitySearchResponse = {
@@ -439,6 +470,23 @@ function freshnessToPerplexityRecency(freshness: string | undefined): string | u
   return map[freshness] ?? undefined;
 }
 
+/**
+ * Map normalized freshness values (pd/pw/pm/py) to Baidu's
+ * search_recency_filter values (week/month/semiyear/year).
+ */
+function freshnessToBaiduRecency(freshness: string | undefined): string | undefined {
+  if (!freshness) {
+    return undefined;
+  }
+  const map: Record<string, string> = {
+    pd: "week", // 百度API最小支持最近7天
+    pw: "week",
+    pm: "month",
+    py: "year",
+  };
+  return map[freshness] ?? undefined;
+}
+
 function isValidIsoDate(value: string): boolean {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
     return false;
@@ -598,6 +646,205 @@ async function runPerplexitySearch(params: {
   return { content, citations };
 }
 
+// 百度智能搜索生成（高性能版）API调用
+async function runBaiduIntelligentSearch(params: BaiduSearchParams): Promise<{ results: BaiduSearchResult[]; content?: string }> {
+  const url = BAIDU_QIANFAN_API_ENDPOINT;
+  
+  const body: any = {
+    messages: [
+      {
+        role: "user",
+        content: params.query
+      }
+    ],
+    stream: false,
+    resource_type_filter: [
+      {
+        type: "web",
+        top_k: params.count
+      },
+      {
+        type: "video",
+        top_k: 0
+      },
+      {
+        type: "image",
+        top_k: 0
+      }
+    ]
+  };
+  
+  // 添加freshness参数
+  const baiduFreshness = freshnessToBaiduRecency(params.freshness);
+  if (baiduFreshness) {
+    body.search_recency_filter = baiduFreshness;
+  }
+  
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "X-Appbuilder-Authorization": `Bearer ${params.apiKey}`,
+      "X-Appbuilder-Request-Id": `req_${Date.now()}`,
+      "X-Appbuilder-User-Id": `user_${Date.now()}`,
+    },
+    body: JSON.stringify(body),
+    signal: withTimeout(undefined, params.timeoutSeconds * 1000),
+  });
+
+  if (!res.ok) {
+    const detail = await readResponseText(res, { maxBytes: 64_000 });
+    throw new Error(`Baidu Intelligent Search API error (${res.status}): ${detail.text || res.statusText}`);
+  }
+
+  const data = await res.json();
+  const results: BaiduSearchResult[] = [];
+
+  // 处理 references 中的搜索结果
+  if (Array.isArray(data.references)) {
+    results.push(...data.references.map((entry: any) => ({
+      title: entry.title || "",
+      url: entry.url || "",
+      description: entry.snippet || entry.content || "",
+      siteName: resolveSiteName(entry.url),
+    })));
+  }
+
+  // 处理模型生成的内容
+  const content = data.choices?.[0]?.message?.content;
+
+  return { results, content };
+}
+
+// 百度智能搜索生成 API调用
+async function runBaiduChatCompletionsSearch(params: BaiduSearchParams): Promise<{ results: BaiduSearchResult[]; content?: string }> {
+  const url = BAIDU_CHAT_COMPLETIONS_ENDPOINT;
+  
+  const body: any = {
+    messages: [
+      {
+        role: "user",
+        content: params.query
+      }
+    ],
+    model: params.model || "ernie-4.5-turbo-32k",
+    search_source: "baidu_search_v2",
+    resource_type_filter: [
+      {
+        type: "web",
+        top_k: params.count
+      }
+    ],
+    temperature: 1e-10
+  };
+  
+  // 添加freshness参数
+  const baiduFreshness = freshnessToBaiduRecency(params.freshness);
+  if (baiduFreshness) {
+    body.search_recency_filter = baiduFreshness;
+  }
+  
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "X-Appbuilder-Authorization": `Bearer ${params.apiKey}`,
+    },
+    body: JSON.stringify(body),
+    signal: withTimeout(undefined, params.timeoutSeconds * 1000),
+  });
+
+  if (!res.ok) {
+    const detail = await readResponseText(res, { maxBytes: 64_000 });
+    throw new Error(`Baidu Chat Completions API error (${res.status}): ${detail.text || res.statusText}`);
+  }
+
+  const data = await res.json();
+  const results: BaiduSearchResult[] = [];
+
+  // 处理搜索结果
+  if (Array.isArray(data.references)) {
+    results.push(...data.references.map((entry: any) => ({
+      title: entry.title || "",
+      url: entry.url || "",
+      description: entry.snippet || entry.content || "",
+      siteName: resolveSiteName(entry.url),
+    })));
+  }
+
+  // 处理模型生成的内容
+  const content = data.choices?.[0]?.message?.content;
+
+  return { results, content };
+}
+
+// 百度搜索 API调用
+async function runBaiduWebSearch(params: BaiduSearchParams): Promise<{ results: BaiduSearchResult[] }> {
+  const url = BAIDU_WEB_SEARCH_ENDPOINT;
+  
+  const body: any = {
+    messages: [
+      {
+        role: "user",
+        content: params.query
+      }
+    ],
+    edition: "standard",
+    search_source: "baidu_search_v2",
+    resource_type_filter: [
+      {
+        type: "web",
+        top_k: params.count
+      }
+    ]
+  };
+  
+  // 添加freshness参数
+  const baiduFreshness = freshnessToBaiduRecency(params.freshness);
+  if (baiduFreshness) {
+    body.search_filter = {
+      range: {
+        page_time: {
+          gte: `now-${baiduFreshness === "week" ? "1w" : baiduFreshness === "month" ? "1M" : baiduFreshness === "year" ? "1y" : "1w"}/d`
+        }
+      }
+    };
+  }
+  
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "X-Appbuilder-Authorization": `Bearer ${params.apiKey}`,
+    },
+    body: JSON.stringify(body),
+    signal: withTimeout(undefined, params.timeoutSeconds * 1000),
+  });
+
+  if (!res.ok) {
+    const detail = await readResponseText(res, { maxBytes: 64_000 });
+    throw new Error(`Baidu Web Search API error (${res.status}): ${detail.text || res.statusText}`);
+  }
+
+  const data = await res.json();
+  const results: BaiduSearchResult[] = [];
+
+  // 处理搜索结果
+  if (Array.isArray(data.references)) {
+    results.push(...data.references.map((entry: any) => ({
+      title: entry.title || "",
+      url: entry.url || "",
+      description: entry.snippet || entry.content || "",
+      siteName: resolveSiteName(entry.url),
+    })));
+  }
+
+  return { results };
+}
+
 async function runGrokSearch(params: {
   query: string;
   apiKey: string;
@@ -662,6 +909,7 @@ async function runWebSearch(params: {
   search_lang?: string;
   ui_lang?: string;
   freshness?: string;
+  baiduSearchType?: BaiduSearchType;
   perplexityBaseUrl?: string;
   perplexityModel?: string;
   grokModel?: string;
@@ -683,7 +931,9 @@ async function runWebSearch(params: {
         ? `${params.provider}:${params.query}:${params.perplexityBaseUrl ?? DEFAULT_PERPLEXITY_BASE_URL}:${params.perplexityModel ?? DEFAULT_PERPLEXITY_MODEL}:${params.freshness || "default"}`
         : params.provider === "grok"
           ? `${params.provider}:${params.query}:${params.grokModel ?? DEFAULT_GROK_MODEL}:${String(params.grokInlineCitations ?? false)}`
-          : `${params.provider}:${params.query}:${params.count}:${params.search_lang || "default"}`,
+          : params.provider === "baidu"
+            ? `${params.provider}:${params.baiduSearchType || "default"}:${params.query}:${params.count}:${params.search_lang || "default"}:${params.freshness || "default"}`
+            : `${params.provider}:${params.query}:${params.count}:${params.search_lang || "default"}`,
   );
   
   console.log('缓存键:', cacheKey);
@@ -755,8 +1005,14 @@ async function runWebSearch(params: {
   }
 
   if (params.provider === "baidu") {
-    console.log('=== 执行百度搜索 ===');
-    console.log('使用百度千帆智能搜索API');
+    console.log('=== 开始百度搜索 ===');
+    console.log('Web Search Version:', WEB_SEARCH_VERSION);
+    console.log('搜索参数:', {
+      query: params.query,
+      count: params.count,
+      timeoutSeconds: params.timeoutSeconds,
+      baiduSearchType: params.baiduSearchType
+    });
     
     // 检查百度API密钥
     if (!params.apiKey) {
@@ -766,190 +1022,175 @@ async function runWebSearch(params: {
     
     console.log('✅ 百度API密钥存在');
     
-    // 使用百度官方智能搜索API
-    const url = BAIDU_QIANFAN_API_ENDPOINT;
-    console.log('API端点:', url);
+    let searchResults;
+    let searchType: BaiduSearchType = params.baiduSearchType || 'intelligent';
     
-    // 百度搜索API请求
-    console.log('发送API请求...');
-    console.log('请求参数:', {
-      query: params.query,
-      count: params.count,
-      timeoutSeconds: params.timeoutSeconds
-    });
-    
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-Appbuilder-Authorization": `Bearer ${params.apiKey}`, // 使用完整的API密钥
-        "X-Appbuilder-Request-Id": `req_${Date.now()}`,
-        "X-Appbuilder-User-Id": `user_${Date.now()}`,
-      },
-      body: JSON.stringify({
-        messages: [
-          {
-            role: "user",
-            content: params.query
-          }
-        ],
-        stream: false,
-        resource_type_filter: [
-          {
-            type: "web",
-            top_k: params.count
-          },
-          {
-            type: "video",
-            top_k: 0
-          },
-          {
-            type: "image",
-            top_k: 0
-          }
-        ]
-      }),
-      signal: withTimeout(undefined, params.timeoutSeconds * 1000),
-    });
-
-    console.log('API响应状态:', res.status);
-    
-    if (!res.ok) {
-      console.log('❌ API请求失败');
-      try {
-        const detailResult = await readResponseText(res, { maxBytes: 64_000 });
-        const detail = detailResult.text;
-        console.log('错误详情:', detail);
-        console.log('错误详情长度:', detail.length);
-        console.log('错误详情类型:', typeof detail);
+    try {
+      if (params.baiduSearchType) {
+        // 用户指定了搜索类型，直接使用指定的API
+        console.log(`直接使用用户指定的搜索类型: ${params.baiduSearchType}`);
         
-        // 检查是否是API限制错误（更宽松的检测）
-        const lowerDetail = detail.toLowerCase();
-        console.log('小写错误详情:', lowerDetail);
-        
-        const isRateLimitError = lowerDetail.includes('rate') && lowerDetail.includes('limit') ||
-                               lowerDetail.includes('429') ||
-                               lowerDetail.includes('too many requests') ||
-                               lowerDetail.includes('请求过于频繁');
-        
-        console.log('是否是速率限制错误:', isRateLimitError);
-        
-        if (isRateLimitError) {
-          console.log('⚠️ API受限，回退到直接抓取搜索结果');
-          // 构建百度搜索URL
-          const searchUrl = `https://www.baidu.com/s?wd=${encodeURIComponent(params.query)}&rn=${params.count}`;
-          console.log('回退URL:', searchUrl);
-          
-          // 执行web fetch操作
-          console.log('执行web fetch操作...');
-          try {
-            console.log('发送fetch请求到:', searchUrl);
-            const fetchRes = await fetch(searchUrl, {
-              method: "GET",
-              headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Connection": "keep-alive"
-              },
-              signal: withTimeout(undefined, params.timeoutSeconds * 1000),
-            });
-            
-            console.log('Fetch响应状态:', fetchRes.status);
-            
-            if (!fetchRes.ok) {
-              throw new Error(`Web fetch error (${fetchRes.status}): ${fetchRes.statusText}`);
-            }
-            
-            console.log('成功获取百度搜索页面，开始解析...');
-            const html = await fetchRes.text();
-            console.log('获取到的HTML长度:', html.length);
-            
-            // 解析搜索结果
-            console.log('解析搜索结果...');
-            const parsedResults = parseBaiduSearchResults(html, params.count);
-            console.log('解析完成，结果数量:', parsedResults.length);
-            console.log('解析结果:', parsedResults);
-            
-            // 构建最终结果
-            const finalResults = parsedResults.map((entry) => {
-              return {
-                title: entry.title ? wrapWebContent(entry.title, "web_search") : "",
-                url: entry.url || "",
-                description: entry.description ? wrapWebContent(entry.description, "web_search") : "",
-                siteName: resolveSiteName(entry.url),
-              };
-            });
-            
-            const payload = {
-              error: "baidu_search_rate_limit",
-              message: "Baidu Search API rate limit reached. Using web fetch fallback.",
-              fallbackUrl: searchUrl,
-              docs: "https://cloud.baidu.com/doc/qianfan-api/s/wmjqtqr7w",
+        switch (params.baiduSearchType) {
+          case 'intelligent':
+            console.log('使用智能搜索生成（高性能版）');
+            searchResults = await runBaiduIntelligentSearch({
               query: params.query,
-              provider: params.provider,
-              count: finalResults.length,
-              tookMs: Date.now() - start,
-              externalContent: {
-                untrusted: true,
-                source: "web_search",
-                provider: params.provider,
-                wrapped: true,
-              },
-              results: finalResults,
-              fallback: true,
-              detail: detail // 添加原始错误详情以便调试
-            };
-            
-            console.log('缓存回退搜索结果');
-            writeCache(SEARCH_CACHE, cacheKey, payload, params.cacheTtlMs);
-            
-            console.log('=== 回退搜索完成 ===');
-            console.log('耗时:', payload.tookMs, 'ms');
-            console.log('最终结果数量:', payload.count);
-            console.log('返回的payload:', payload);
-            
-            return payload;
-          } catch (fetchError) {
-            console.log('❌ 回退抓取失败:', fetchError);
-            console.log('回退抓取错误详情:', fetchError.message);
-            // 如果回退也失败，返回错误信息
-            return {
-              error: "baidu_search_fallback_failed",
-              message: `Baidu Search API rate limit reached and web fetch fallback failed: ${fetchError.message}`,
-              fallbackUrl: searchUrl,
-              docs: "https://cloud.baidu.com/doc/qianfan-api/s/wmjqtqr7w",
+              apiKey: params.apiKey,
+              count: params.count,
+              timeoutSeconds: params.timeoutSeconds,
+              freshness: params.freshness
+            });
+            console.log('智能搜索生成（高性能版）成功，结果数量:', searchResults.results.length);
+            break;
+          case 'chat_completions':
+            console.log('使用智能搜索生成');
+            searchResults = await runBaiduChatCompletionsSearch({
               query: params.query,
-              provider: params.provider,
-              tookMs: Date.now() - start,
-              externalContent: {
-                untrusted: true,
-                source: "web_search",
-                provider: params.provider,
-                wrapped: true,
-              },
-              results: [],
-              detail: detail,
-              fetchError: fetchError.message
-            };
-          }
-        } else {
-          console.log('不是速率限制错误，抛出异常');
-          throw new Error(`Baidu Search API error (${res.status}): ${detail || res.statusText}`);
+              apiKey: params.apiKey,
+              count: params.count,
+              timeoutSeconds: params.timeoutSeconds,
+              freshness: params.freshness
+            });
+            console.log('智能搜索生成成功，结果数量:', searchResults.results.length);
+            break;
+          case 'web_search':
+            console.log('使用百度搜索');
+            const webSearchResults = await runBaiduWebSearch({
+              query: params.query,
+              apiKey: params.apiKey,
+              count: params.count,
+              timeoutSeconds: params.timeoutSeconds,
+              freshness: params.freshness
+            });
+            searchResults = { ...webSearchResults, content: undefined };
+            console.log('百度搜索成功，结果数量:', searchResults.results.length);
+            break;
+          default:
+            throw new Error(`Unknown Baidu search type: ${params.baiduSearchType}`);
         }
-      } catch (error) {
-        console.log('❌ 错误处理过程中发生异常:', error);
-        // 如果错误处理过程中发生异常，也尝试回退
-        console.log('错误处理异常，尝试回退...');
-        const searchUrl = `https://www.baidu.com/s?wd=${encodeURIComponent(params.query)}&rn=${params.count}`;
-        return {
-          error: "baidu_search_error",
-          message: `Baidu Search API error: ${error.message}. Falling back to web fetch.`,
+      } else {
+        // 用户未指定搜索类型，使用自动降级机制
+        console.log('用户未指定搜索类型，使用自动降级机制');
+        
+        try {
+          // 1. 首先尝试使用智能搜索生成（高性能版）
+          console.log('1. 尝试使用智能搜索生成（高性能版）');
+          searchType = 'intelligent';
+          searchResults = await runBaiduIntelligentSearch({
+            query: params.query,
+            apiKey: params.apiKey,
+            count: params.count,
+            timeoutSeconds: params.timeoutSeconds,
+            freshness: params.freshness
+          });
+          console.log('智能搜索生成（高性能版）成功，结果数量:', searchResults.results.length);
+        } catch (error) {
+          console.log('智能搜索生成（高性能版）失败，尝试智能搜索生成:', error.message);
+          try {
+            // 2. 失败后尝试使用智能搜索生成
+            console.log('2. 尝试使用智能搜索生成');
+            searchType = 'chat_completions';
+            searchResults = await runBaiduChatCompletionsSearch({
+              query: params.query,
+              apiKey: params.apiKey,
+              count: params.count,
+              timeoutSeconds: params.timeoutSeconds,
+              freshness: params.freshness
+            });
+            console.log('智能搜索生成成功，结果数量:', searchResults.results.length);
+          } catch (error) {
+            console.log('智能搜索生成失败，尝试百度搜索:', error.message);
+            try {
+              // 3. 失败后尝试使用百度搜索
+              console.log('3. 尝试使用百度搜索');
+              searchType = 'web_search';
+              const webSearchResults = await runBaiduWebSearch({
+                query: params.query,
+                apiKey: params.apiKey,
+                count: params.count,
+                timeoutSeconds: params.timeoutSeconds,
+                freshness: params.freshness
+              });
+              searchResults = { ...webSearchResults, content: undefined };
+              console.log('百度搜索成功，结果数量:', searchResults.results.length);
+            } catch (error) {
+              throw error;
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.log('❌ 所有百度搜索API都失败，使用回退方案');
+      // 所有API都失败，使用网页抓取回退
+      const searchUrl = `https://www.baidu.com/s?wd=${encodeURIComponent(params.query)}&rn=${params.count}`;
+      
+      try {
+        const fetchRes = await fetch(searchUrl, {
+          method: "GET",
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Connection": "keep-alive"
+          },
+          signal: withTimeout(undefined, params.timeoutSeconds * 1000),
+        });
+        
+        if (!fetchRes.ok) {
+          throw new Error(`Web fetch error (${fetchRes.status}): ${fetchRes.statusText}`);
+        }
+        
+        const html = await fetchRes.text();
+        const parsedResults = parseBaiduSearchResults(html, params.count);
+        
+        const finalResults = parsedResults.map((entry) => {
+          return {
+            title: entry.title ? wrapWebContent(entry.title, "web_search") : "",
+            url: entry.url || "",
+            description: entry.description ? wrapWebContent(entry.description, "web_search") : "",
+            siteName: resolveSiteName(entry.url),
+          };
+        });
+        
+        const payload = {
+          error: "baidu_search_all_failed",
+          message: "All Baidu Search APIs failed. Using web fetch fallback.",
           fallbackUrl: searchUrl,
           docs: "https://cloud.baidu.com/doc/qianfan-api/s/wmjqtqr7w",
           query: params.query,
           provider: params.provider,
+          searchType: params.baiduSearchType || searchType,
+          count: finalResults.length,
+          tookMs: Date.now() - start,
+          externalContent: {
+            untrusted: true,
+            source: "web_search",
+            provider: params.provider,
+            wrapped: true,
+          },
+          results: finalResults,
+          fallback: true,
+          detail: error.message
+        };
+        
+        console.log('缓存回退搜索结果');
+        writeCache(SEARCH_CACHE, cacheKey, payload, params.cacheTtlMs);
+        
+        console.log('=== 回退搜索完成 ===');
+        console.log('耗时:', payload.tookMs, 'ms');
+        console.log('最终结果数量:', payload.count);
+        console.log('回退payload:', JSON.stringify(payload, null, 2));
+        
+        return payload;
+      } catch (fetchError) {
+        console.log('❌ 回退抓取也失败');
+        return {
+          error: "baidu_search_fallback_failed",
+          message: `All Baidu Search methods failed: ${fetchError.message}`,
+          docs: "https://cloud.baidu.com/doc/qianfan-api/s/wmjqtqr7w",
+          query: params.query,
+          provider: params.provider,
+          searchType: params.baiduSearchType || searchType,
           tookMs: Date.now() - start,
           externalContent: {
             untrusted: true,
@@ -961,65 +1202,32 @@ async function runWebSearch(params: {
         };
       }
     }
-
-    console.log('✅ API请求成功');
-    const data = await res.json();
-    console.log('百度搜索API响应:', JSON.stringify(data, null, 2));
-    console.log('响应结果数量:', data.references ? data.references.length : 0);
-
     
-    // 处理百度搜索API响应
-    let finalResults = [];
-    
+    // 处理搜索结果
     console.log('开始处理搜索结果...');
+    const finalResults = searchResults.results.map((entry: BaiduSearchResult, index: number) => {
+      return {
+        title: entry.title ? wrapWebContent(entry.title, "web_search") : "",
+        url: entry.url || "",
+        description: entry.description ? wrapWebContent(entry.description, "web_search") : "",
+        siteName: entry.siteName || resolveSiteName(entry.url),
+      };
+    });
     
-    // 优先使用 references 中的搜索结果
-    if (Array.isArray(data.references)) {
-      console.log('使用references中的搜索结果，数量:', data.references.length);
-      finalResults = data.references.map((entry: any, index: number) => {
-        const title = entry.title || "";
-        const url = entry.url || "";
-        const description = entry.snippet || entry.content || "";
-        const rawSiteName = resolveSiteName(url);
-        console.log(`结果 ${index + 1}:`, {
-          title: title,
-          url: url,
-          site: rawSiteName || entry.website
-        });
-        return {
-          title: title ? wrapWebContent(title, "web_search") : "",
-          url, // Keep raw for tool chaining
-          description: description ? wrapWebContent(description, "web_search") : "",
-          published: entry.date || undefined,
-          siteName: rawSiteName || entry.website || undefined,
-        };
+    if (finalResults.length === 0 && searchResults.content) {
+      console.log('没有搜索结果，使用模型生成的内容作为单一结果');
+      finalResults.push({
+        title: wrapWebContent(params.query, "web_search"),
+        url: `https://www.baidu.com/s?wd=${encodeURIComponent(params.query)}`,
+        description: wrapWebContent(searchResults.content.substring(0, 200) + (searchResults.content.length > 200 ? '...' : ''), "web_search"),
+        siteName: "www.baidu.com",
       });
     }
-
-    // 如果没有搜索结果，使用模型生成的内容作为单一结果
-    if (finalResults.length === 0 && data.choices && data.choices.length > 0) {
-      const content = data.choices[0].message?.content || "";
-      if (content) {
-        console.log('没有搜索结果，使用模型生成的内容作为单一结果');
-        finalResults = [{
-          title: wrapWebContent(params.query, "web_search"),
-          url: `https://www.baidu.com/s?wd=${encodeURIComponent(params.query)}`,
-          description: wrapWebContent(content.substring(0, 200) + (content.length > 200 ? '...' : ''), "web_search"),
-          siteName: "www.baidu.com",
-        }];
-        console.log('使用模型生成的内容:', content.substring(0, 100) + (content.length > 100 ? '...' : ''));
-      }
-    }
-
-    if (finalResults.length === 0) {
-      console.log('❌ 没有找到任何搜索结果');
-    } else {
-      console.log('✅ 成功获取搜索结果，数量:', finalResults.length);
-    }
-
+    
     const payload = {
       query: params.query,
       provider: params.provider,
+      searchType: searchType,
       count: finalResults.length,
       tookMs: Date.now() - start,
       externalContent: {
@@ -1029,16 +1237,16 @@ async function runWebSearch(params: {
         wrapped: true,
       },
       results: finalResults,
-      // 保留原始的模型回答内容
-      content: data.choices?.[0]?.message?.content ? wrapWebContent(data.choices[0].message.content, "web_search") : undefined,
+      content: searchResults.content ? wrapWebContent(searchResults.content, "web_search") : undefined,
     };
     
     console.log('缓存搜索结果');
     writeCache(SEARCH_CACHE, cacheKey, payload, params.cacheTtlMs);
     
-    console.log('=== 搜索完成 ===');
+    console.log('=== 百度搜索完成 ===');
     console.log('耗时:', payload.tookMs, 'ms');
     console.log('最终结果数量:', payload.count);
+    console.log('使用的搜索类型:', searchType);
     
     return payload;
   }
@@ -1161,10 +1369,24 @@ export function createWebSearchTool(options?: {
       const search_lang = readStringParam(params, "search_lang");
       const ui_lang = readStringParam(params, "ui_lang");
       const rawFreshness = readStringParam(params, "freshness");
-      if (rawFreshness && provider !== "brave" && provider !== "perplexity") {
+      const baiduSearchType = readStringParam(params, "baiduSearchType");
+      
+      // 验证baiduSearchType参数
+      if (baiduSearchType && provider === "baidu") {
+        const validTypes = ['intelligent', 'chat_completions', 'web_search'];
+        if (!validTypes.includes(baiduSearchType)) {
+          return jsonResult({
+            error: "invalid_baidu_search_type",
+            message: `baiduSearchType must be one of: ${validTypes.join(', ')}`,
+            docs: "https://docs.openclaw.ai/tools/web",
+          });
+        }
+      }
+      
+      if (rawFreshness && provider !== "brave" && provider !== "perplexity" && provider !== "baidu") {
         return jsonResult({
           error: "unsupported_freshness",
-          message: "freshness is only supported by the Brave and Perplexity web_search providers.",
+          message: "freshness is only supported by the Brave, Perplexity and Baidu web_search providers.",
           docs: "https://docs.openclaw.ai/tools/web",
         });
       }
@@ -1188,6 +1410,7 @@ export function createWebSearchTool(options?: {
         search_lang,
         ui_lang,
         freshness,
+        baiduSearchType: baiduSearchType as BaiduSearchType | undefined,
         perplexityBaseUrl: resolvePerplexityBaseUrl(
           perplexityConfig,
           perplexityAuth?.source,
